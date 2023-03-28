@@ -1,0 +1,321 @@
+---
+title: "ml_hw9"
+author: "Mohammad"
+date: "2023-03-27"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(randomForest)
+library(caret)
+library(pROC)
+library(rpart.plot)
+library(rpart)
+library(lattice)
+library(NHANES)
+knitr::opts_chunk$set(
+	echo = TRUE,
+	warning = FALSE,
+	fig.width = 8, 
+  fig.height = 6,
+  out.width = "90%")
+```
+
+
+
+## Goal: use three different algorithms (random forest, SVC and logistic regression) to generate a clinical risk score for diabetes, then compare the three models.
+
+
+### Data Processing
+
+The code below to load and subset the data and remove missing observations.
+
+```{r data_prep}
+set.seed(123)
+
+data(NHANES)
+
+#Check missingness in the data
+Amelia::missmap(NHANES)
+
+nhanes <-
+    NHANES %>% 
+    as_tibble(NHANES) %>% 
+    select(Age, Race1, Education, Poverty, Weight, Height, Pulse, Diabetes, BMI, PhysActive, Smoke100, BPSysAve, BPDiaAve, TotChol) %>%
+    janitor::clean_names() %>% 
+    drop_na() %>% 
+    distinct()
+
+str(nhanes)
+summary(nhanes[, "diabetes"])
+```
+
+### Partitioning data 
+
+Partition data into a 70/30 training/testing split.
+
+```{r partition}
+set.seed(123)
+
+train.index <- 
+    nhanes$diabetes %>% 
+    createDataPartition(p = 0.7, list = FALSE)
+
+train_df <- 
+    nhanes[train.index, ]
+
+test_df <- 
+    nhanes[-train.index, ]
+```
+
+### Models
+
+Here we construct three models in the training set using each of the three algorithms to predict diabetes. For the random forest, we try 3 different values of mtry. For SVC, vary the cost parameter using a vector of values in a grid. We use up sampling for all three models.
+
+### Model 1: Random Forest with 3 values of mtry and 3 values of ntree
+
+```{r}
+# Try mtry of all, half of all, sqrt of all, 
+# Try ntree of 100, 300, 500
+mtry <- 
+    c(ncol(train_df)-1, sqrt(ncol(train_df)-1), 0.5*ncol(train_df)-1)
+
+mtrygrid <- 
+    expand.grid(.mtry = round(mtry))
+
+control <- 
+    trainControl(method = "cv", number = 10, sampling = "up")
+
+tree_num <- 
+    seq(100,500, by = 200)
+
+results_trees <- 
+    list()
+
+for (ntree in tree_num){
+    set.seed(123)
+    nrf <- 
+        train(diabetes ~ ., data = train_df, method = "rf", trControl = control, metric = "Accuracy", tuneGrid = mtrygrid,
+              importance = TRUE, ntree = ntree)
+    index <- 
+        toString(ntree)
+    
+    results_trees[[index]] <- 
+        nrf$results
+}
+
+output <- 
+    bind_rows(results_trees, .id = "ntrees")
+
+best_tune <- 
+    output[which.max(output[,"Accuracy"]), ]
+
+best_tune$mtry
+results_trees
+
+mtrygrid <- expand.grid(.mtry = best_tune$mtry)
+
+set.seed(123)
+    rf_bt <- 
+        train(diabetes ~., data = train_df, method = "rf", trControl = control, metric = "Accuracy", tuneGrid = mtrygrid,
+              importance = TRUE, ntree = as.numeric(best_tune$ntrees))
+
+confusionMatrix(rf_bt)
+varImp(rf_bt)
+varImpPlot(rf_bt$finalModel)
+```
+
+Increasing the number of cross validations to 10 instead of 5 and using up sampling instead of down improves accuracy to 0.88. The most important variables were age, total cholesterol, and BMI respectively.
+
+### Model 2: Support Vector Classifier
+
+```{r}
+set.seed(123)
+
+control <- 
+    trainControl(method = "cv", number = 5, sampling = "up", classProbs = TRUE)
+
+#Repeat expanding the grid search
+set.seed(123)
+
+nsvc <- train(diabetes ~ ., data = train_df, method = "svmLinear", trControl= control, preProcess = c("center", "scale"),
+             probability = TRUE, tuneGrid = expand.grid(C = seq(0.0001,100, length = 10)))
+
+nsvc$bestTune
+nsvc$results
+confusionMatrix(nsvc)
+```
+
+Initially I used up sampling, increasing the number of cross validation to 10 and the tuneGrid length to 50 took too long (more than 60 minutes and was still running). I reduced the tuneGrid length to 20 but the issue persisted. I then reduced the number of cross validations to 5 and the tuneGrid to 10. It still took 45+ minutes for my laptop to execute it but it eventually worked. The resulting accuracy was 0.75
+
+### Model 3: Logistic Regression
+
+```{r}
+set.seed(123)
+
+control <- 
+    trainControl(method = "cv", number = 10, sampling = "up")
+
+nlogit <-
+    train(diabetes~., data = train_df, method = "glm", family = "binomial", preProcess = c("center", "scale"),
+          trControl = control)
+
+nlogit$results
+confusionMatrix(nlogit)
+coef(nlogit$finalModel)
+
+```
+
+
+Using up sampling and 10 fold cross validation in a logistic regression model resulted in an accuracy of 0.75. The most important variables were age, total cholesterol, and BMI respectively. 
+
+### Output predicted probabilities from each of the three models applied within the testing set.
+
+```{r}
+
+#Predict in test-set and output probabilities
+rf_probs <-
+    predict(nrf, test_df, type = "prob")
+
+#Pull out predicted probabilities for Diabetes=Yes
+rf_pp <-
+    rf_probs[,2]
+
+svc_probs <-
+    predict(nsvc, test_df, type = "prob")
+
+svc_pp <- 
+    svc_probs[,2]
+
+#Predict in test-set using response type
+logit_probs <-
+    predict(nlogit, test_df, type = "prob")
+
+logit_pp <- logit_probs[,2]
+```
+
+### Plot and compare calibration curves across the three algorithms.
+
+```{r}
+pred_prob <- 
+    data.frame(Class = test_df$diabetes, logit = logit_pp, rf = rf_pp, svc = svc_pp)
+
+calplot <- 
+    (calibration(Class ~ logit + rf + svc, data = pred_prob, class = "Yes", cuts = 10))
+
+xyplot(calplot, auto.key = list(columns = 3))
+```
+
+### Calibrate the probabilities from SVC and RF
+
+Partition testing data into 2 sets: set to train calibration and then set to evaluate results
+
+Method 1: Platt's Scaling-train a logistic regression model on the outputs of your classifier
+
+```{r}
+
+set.seed(123)
+
+cal_index <-
+    test_df$diabetes %>% 
+    createDataPartition(p=0.5, list=F)
+
+cal_data <-
+    test_df[cal_index, ]
+
+final_data <-
+    test_df[-cal_index, ]
+
+#Calibration of RF
+
+#Predict on test-set without scaling to obtain raw pred prob in test set
+rf.probs.nocal <-
+    predict(nrf, final_data, type="prob")
+
+rf.pp.nocal <-
+    rf.probs.nocal[,2]
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+rf.probs.cal <- 
+    predict(nrf, cal_data, type="prob")
+
+rf.pp.cal <-
+    rf.probs.cal[,2]
+
+#Add to dataset with actual values from calibration data
+calibrf.data.frame <-
+    data.frame(rf.pp.cal, cal_data$diabetes)
+
+colnames(calibrf.data.frame) <-
+    c("x", "y")
+
+#Use logistic regression to model predicted probabilities from calibration data to actual vales
+calibrf.model <- 
+    glm(y ~ x, data = calibrf.data.frame, family = binomial)
+
+#Apply calibration model above to raw predicted probabilities from test set
+data.test.rf <-
+    data.frame(rf.pp.nocal)
+
+colnames(data.test.rf) <- 
+    c("x")
+
+platt.data.rf <-
+    predict(calibrf.model, data.test.rf, type="response")
+
+platt.prob.rf <-
+    data.frame(Class = final_data$diabetes, rf.platt = platt.data.rf, rf=rf.pp.nocal)
+
+calplot.rf <- 
+    (calibration(Class ~ rf.platt+rf, data=platt.prob.rf, class="Yes", cuts=10))
+
+xyplot(calplot.rf, auto.key=list(columns=2))
+
+#Calibration of SVC
+
+#Predict on test-set without scaling
+svc.nocal <-
+    predict(nsvc,final_data, type="prob")
+
+svc.pp.nocal <-
+    svc.nocal[,2]
+
+
+#Apply model developed on training data to calibration dataset to obtain predictions
+svc.cal <-
+    predict(nsvc, cal_data, type = "prob")
+svc.pp.cal <-
+    svc.cal[,2]
+
+#Add to dataset with actual values from calibration data
+
+calib.data.frame <-
+    data.frame(svc.pp.cal, cal_data$diabetes)
+
+colnames(calib.data.frame) <-
+    c("x", "y")
+
+calib.model <-
+    glm(y ~ x, data=calib.data.frame, family = binomial)
+
+#Predict on test set using model developed in calibration
+data.test <- 
+    data.frame(svc.pp.nocal)
+
+colnames(data.test) <-
+    c("x")
+
+platt.data <- 
+    predict(calib.model, data.test, type="response")
+
+platt.prob <- 
+    data.frame(Class = final_data$diabetes, svc.platt=platt.data, svc=svc.pp.nocal)
+
+calplot <-
+    (calibration(Class ~ svc.platt+svc, data=platt.prob, class="Yes", cuts=10))
+
+xyplot(calplot, auto.key = list(columns=2))
+```
+
+Based on the accuracy results and the calibrated curves, the random forest model would be the "optimal model". One additional evaluation to perform prior to implementing the model in a clinical setting is examining the data to ensure its quality (accurate and representative) to avoid any unintended consequnces on minorities or under-privileged communities. 
